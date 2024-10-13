@@ -59,12 +59,10 @@ class GrammarBuilder:
             grammars[grammar_handle] = format.format_enum(type_wrapper.vanilla_type.__name__, members)
         return grammar_handle
 
-class Thing:
+# NOTE If I come back to allow a Thing to be a dataclass, remove this inheritance
+class Thing(BaseModel):
     @classmethod
     def schema(cls, semantic: bool = False):
-        if not issubclass(cls, BaseModel):
-            raise ValueError(f'Thing {cls} is not a Pydantic BaseModel')
-
         fields = cls.model_fields
         if not semantic:
             return {name: TypeWrapper.from_field_info(field_info) for name, field_info in fields.items()}
