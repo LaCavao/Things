@@ -9,7 +9,7 @@ Automatically convert Pydantic models into schemas:
     - ...see the EBNF example (haven't evaluated these outside GBNF)
 - Semantic schemas for use in prompting (including field descriptions where provided)
 
-This module is minimaln; it doesn't touch the inference process, and that is very intentional.
+This module is minimal; it doesn't touch the inference process, and that is very intentional.
 It is purely concerned with the representation of data.
 
 ## Usage
