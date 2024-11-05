@@ -23,13 +23,13 @@ class GrammarBuilder:
             rule = cls._PRIMITIVES[type_wrapper.vanilla_type](format)
             grammars[type_wrapper.vanilla_type.__name__] = rule
             return [type_wrapper.vanilla_type.__name__]
-        elif issubclass(type_wrapper.vanilla_type, Thing):
+        elif type_wrapper.origin in (list, tuple):
+            return cls._list_grammar(type_wrapper, format, grammars)
+        elif isinstance(type_wrapper.vanilla_type, type) and issubclass(type_wrapper.vanilla_type, Thing):
             rule = type_wrapper.vanilla_type.grammar(format=format, grammars=grammars)[type_wrapper.vanilla_type.__name__.lower()]
             grammars[type_wrapper.vanilla_type.__name__.lower()] = rule
             return [type_wrapper.vanilla_type.__name__.lower()]
-        elif type_wrapper.origin in (list, tuple):
-            return cls._list_grammar(type_wrapper, format, grammars)
-        elif issubclass(type_wrapper.vanilla_type, Enum):
+        elif isinstance(type_wrapper.vanilla_type, type) and issubclass(type_wrapper.vanilla_type, Enum):
             return [cls._enum_grammar(type_wrapper, format, grammars)]
         else:
             raise ValueError(f'Unsupported type: {type_wrapper}')
@@ -96,10 +96,15 @@ class Thing(BaseModel):
     def _process_nested_types(tw, process_func):
         if isinstance(tw.vanilla_type, UnionType):
             for arg in tw.args:
-                if issubclass(arg, (Thing, Enum)):
+                if isinstance(arg, type) and issubclass(arg, (Thing, Enum)):
                     process_func(arg)
-        elif issubclass(tw.vanilla_type, (Thing, Enum)):
-            process_func(tw.vanilla_type)
+        elif isinstance(tw.vanilla_type, type):
+            if issubclass(tw.vanilla_type, (Thing, Enum)):
+                process_func(tw.vanilla_type)
+        elif tw.origin in (list, tuple) and tw.args:
+            # type args of list/tuple
+            inner_tw = TypeWrapper(tw.args[0], get_origin(tw.args[0]), get_args(tw.args[0]), True)
+            Thing._process_nested_types(inner_tw, process_func)
 
     @classmethod
     def grammar(cls, format: str | GrammarFormat = 'gbnf', grammars: dict = None, as_str: bool = False):
@@ -111,8 +116,6 @@ class Thing(BaseModel):
         if isinstance(format, str):
             if format == 'gbnf':
                 format_obj = GBNFFormat()
-            # elif format == 'ebnf': TODO fix
-            #     format_obj = EBNFFormat()
             else:
                 raise ValueError(f"Unsupported grammar format string: {format}")
         elif isinstance(format, GrammarFormat):
