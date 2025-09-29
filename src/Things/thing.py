@@ -1,139 +1,175 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from enum import Enum
-from typing import get_origin, get_args, Union, Any, Callable
+from typing import get_origin, get_args, Union
 from types import UnionType, NoneType
-from .type_wrapper import TypeWrapper
-from .grammars.base import GrammarFormat
-from .grammars.gbnf import GBNFFormat
-from .grammars.ebnf import EBNFFormat
+from .formats import FORMATS
 
-class GrammarBuilder:
-    _PRIMITIVES = {
-        str: lambda f: f.format_primitive('str'),
-        int: lambda f: f.format_primitive('int'),
-        float: lambda f: f.format_primitive('float'),
-        bool: lambda f: f.format_primitive('bool'),
-    }
-
-    @classmethod
-    def from_type(cls, type_wrapper: 'TypeWrapper', format: GrammarFormat, grammars: dict = None):
-        if grammars is None:
-            grammars = {}
-        if type_wrapper.vanilla_type in cls._PRIMITIVES:
-            rule = cls._PRIMITIVES[type_wrapper.vanilla_type](format)
-            grammars[type_wrapper.vanilla_type.__name__] = rule
-            return [type_wrapper.vanilla_type.__name__]
-        elif type_wrapper.origin in (list, tuple):
-            return cls._list_grammar(type_wrapper, format, grammars)
-        elif isinstance(type_wrapper.vanilla_type, type) and issubclass(type_wrapper.vanilla_type, Thing):
-            rule = type_wrapper.vanilla_type.grammar(format=format, grammars=grammars)[type_wrapper.vanilla_type.__name__.lower()]
-            grammars[type_wrapper.vanilla_type.__name__.lower()] = rule
-            return [type_wrapper.vanilla_type.__name__.lower()]
-        elif isinstance(type_wrapper.vanilla_type, type) and issubclass(type_wrapper.vanilla_type, Enum):
-            return [cls._enum_grammar(type_wrapper, format, grammars)]
-        else:
-            raise ValueError(f'Unsupported type: {type_wrapper}')
-
-    @classmethod
-    def _list_grammar(cls, type_wrapper: 'TypeWrapper', format: GrammarFormat, grammars: dict) -> list[str]:
-        if len(type_wrapper.args) != 1:
-            raise ValueError(f'List type {type_wrapper} should have exactly one argument')
-
-        member = TypeWrapper(type_wrapper.args[0], get_origin(type_wrapper.args[0]), get_args(type_wrapper.args[0]), True)
-        mem_rules = cls.from_type(member, format, grammars=grammars)
-        if isinstance(mem_rules, str):
-            mem_rules = [mem_rules]
-
-        rule_name = f'{mem_rules[0]}-arr'
-
-        if rule_name not in grammars:
-            grammars[rule_name] = format.format_list(mem_rules[0])
-
-        return [rule_name] + mem_rules
-
-    @classmethod
-    def _enum_grammar(cls, type_wrapper: 'TypeWrapper', format: GrammarFormat, grammars: dict) -> str:
-        members = type_wrapper.vanilla_type._value2member_map_.keys()
-        grammar_handle = type_wrapper.vanilla_type.__name__.lower()
-        if grammar_handle not in grammars:
-            grammars[grammar_handle] = format.format_enum(type_wrapper.vanilla_type.__name__, members)
-        return grammar_handle
-
-# NOTE If I come back to allow a Thing to be a dataclass, remove this inheritance
 class Thing(BaseModel):
     @classmethod
-    def schema(cls, semantic: bool = False):
-        fields = cls.model_fields
-        if not semantic:
-            return {name: TypeWrapper.from_field_info(field_info) for name, field_info in fields.items()}
-
-        schema_parts = []
-        processed_types = set()
-
-        def process_type(current_type):
-            if current_type.__name__ in processed_types:
+    def compile(cls, format='gbnf', as_str=True):
+        if format not in FORMATS:
+            raise ValueError(f"Unsupported format: {format}")
+        
+        templates = FORMATS[format]
+        rules = {}
+        
+        def compile_type(type_hint, name=None, required=True):
+            origin = get_origin(type_hint)
+            args = get_args(type_hint)
+            
+            if type_hint in (str, int, float, bool):
+                prim_name = type_hint.__name__
+                if prim_name not in rules:
+                    rules[prim_name] = templates['primitives'][prim_name]
+                return prim_name
+            
+            if origin in (Union, UnionType) or isinstance(type_hint, UnionType):
+                types = args if args else get_args(type_hint)
+                non_none = [t for t in types if t is not NoneType]
+                if len(non_none) == 1:
+                    return compile_type(non_none[0], name, NoneType not in types)
+                raise ValueError(f"Complex unions not supported: {type_hint}")
+            
+            if origin in (list, tuple):
+                item_type = compile_type(args[0])
+                list_name = f"{item_type}-arr"
+                if list_name not in rules:
+                    rules[list_name] = templates['list'].format(item=item_type)
+                return list_name
+            
+            if isinstance(type_hint, type) and issubclass(type_hint, Enum):
+                enum_name = type_hint.__name__.lower()
+                if enum_name not in rules:
+                    values = '|'.join(
+                        templates['enum_value'].format(value=v) 
+                        for v in type_hint._value2member_map_.keys()
+                    )
+                    rules[enum_name] = templates['enum'].format(
+                        name=enum_name, 
+                        values=values
+                    )
+                return enum_name
+            
+            if isinstance(type_hint, type) and issubclass(type_hint, Thing):
+                nested_name = type_hint.__name__.lower()
+                if nested_name not in rules:
+                    compile_thing(type_hint)
+                return nested_name
+            
+            raise ValueError(f"Unsupported type: {type_hint}")
+        
+        def compile_thing(thing_cls):
+            class_name = thing_cls.__name__.lower()
+            if class_name in rules:
                 return
-            processed_types.add(current_type.__name__)
-
-            if issubclass(current_type, Enum):
-                enum_values = [f"    {value}" for value in current_type._value2member_map_.keys()]
-                schema_parts.append(f"{current_type.__name__} (ENUM):\n" + "\n".join(enum_values))
-            elif issubclass(current_type, Thing):
-                class_schema = []
-                for field_name, field_info in current_type.model_fields.items():
-                    tw = TypeWrapper.from_field_info(field_info)
-                    description = f" ({field_info.description})" if field_info.description else ""
-                    class_schema.append(f"    {field_name}: {tw.type_str()}{description}")
-
-                    cls._process_nested_types(tw, process_type)
-
-                schema_parts.append(f"{current_type.__name__}:\n" + "\n".join(class_schema))
-
-        process_type(cls)
-        return "\n".join(schema_parts)
-
-    @staticmethod
-    def _process_nested_types(tw, process_func):
-        if isinstance(tw.vanilla_type, UnionType):
-            for arg in tw.args:
-                if isinstance(arg, type) and issubclass(arg, (Thing, Enum)):
-                    process_func(arg)
-        elif isinstance(tw.vanilla_type, type):
-            if issubclass(tw.vanilla_type, (Thing, Enum)):
-                process_func(tw.vanilla_type)
-        elif tw.origin in (list, tuple) and tw.args:
-            # type args of list/tuple
-            inner_tw = TypeWrapper(tw.args[0], get_origin(tw.args[0]), get_args(tw.args[0]), True)
-            Thing._process_nested_types(inner_tw, process_func)
-
-    @classmethod
-    def grammar(cls, format: str | GrammarFormat = 'gbnf', grammars: dict = None, as_str: bool = False):
-        fields = cls.schema()
-        field_rules = []
-
-        gen_grammars = {} if grammars is None else grammars
-
-        if isinstance(format, str):
-            if format == 'gbnf':
-                format_obj = GBNFFormat()
-            else:
-                raise ValueError(f"Unsupported grammar format string: {format}")
-        elif isinstance(format, GrammarFormat):
-            format_obj = format
-        else:
-            raise ValueError(f"Invalid format type: {type(format)}. Expected str or GrammarFormat.")
-
-        for name, type_wrapper in fields.items():
-            rules = GrammarBuilder.from_type(type_wrapper, format_obj, grammars=gen_grammars)
-            if isinstance(rules, str):
-                rules = [rules]
+            
+            # Reserve the name to prevent infinite recursion
+            rules[class_name] = None
+            
+            fields = []
+            for field_name, field_info in thing_cls.model_fields.items():
+                field_type = field_info.annotation
+                required = field_info.is_required()
                 
-            field_rules.append(format_obj.format_field(name, rules[0], type_wrapper.is_required))
-
-        cls_rule = format_obj.format_object(cls.__name__, field_rules)
-        gen_grammars[cls.__name__.lower()] = cls_rule
-
+                if isinstance(field_type, UnionType) and NoneType in get_args(field_type):
+                    non_none = [t for t in get_args(field_type) if t is not NoneType]
+                    field_type = non_none[0] if len(non_none) == 1 else Union[tuple(non_none)]
+                    required = False
+                
+                type_name = compile_type(field_type, field_name, required)
+                
+                field_str = templates['field'].format(
+                    name=field_name,
+                    type=type_name,
+                    optional='' if required else templates.get('optional', '')
+                )
+                fields.append(field_str)
+            
+            rules[class_name] = templates['object'].format(
+                name=class_name,
+                fields=templates['field_sep'].join(fields)
+            )
+        
+        compile_thing(cls)
+        
         if as_str:
-            return format_obj.format_root(cls.__name__.lower(), list(gen_grammars.values()))
-
-        return gen_grammars
+            rule_strs = '\n'.join(rules.values())
+            return templates['root'].format(name=cls.__name__.lower(), rules=rule_strs)
+        
+        return rules
+    
+    @classmethod
+    def schema(cls, semantic=False):
+        if not semantic:
+            return super().model_json_schema()
+        
+        lines = []
+        seen = set()
+        to_process = []
+        
+        def format_type(type_hint):
+            origin = get_origin(type_hint)
+            args = get_args(type_hint)
+            
+            if type_hint in (str, int, float, bool):
+                return type_hint.__name__
+            
+            if origin in (Union, UnionType) or isinstance(type_hint, UnionType):
+                types = args if args else get_args(type_hint)
+                non_none = [t for t in types if t is not NoneType]
+                if NoneType in types and len(non_none) == 1:
+                    return f"{format_type(non_none[0])} | None"
+                return ' | '.join(format_type(t) for t in types)
+            
+            if origin in (list, tuple):
+                inner = format_type(args[0])
+                return f"{origin.__name__}[{inner}]"
+            
+            if isinstance(type_hint, type):
+                return type_hint.__name__
+            
+            return str(type_hint).replace('typing.', '').replace('<class ', '').replace('>', '').replace("'", '')
+        
+        def collect_dependencies(type_hint, deps):
+            origin = get_origin(type_hint)
+            args = get_args(type_hint)
+            
+            if origin in (list, tuple) and args:
+                collect_dependencies(args[0], deps)
+            elif origin in (Union, UnionType) or isinstance(type_hint, UnionType):
+                for t in (args if args else get_args(type_hint)):
+                    if t is not NoneType:
+                        collect_dependencies(t, deps)
+            elif isinstance(type_hint, type) and issubclass(type_hint, (Thing, Enum)):
+                if type_hint.__name__ not in seen:
+                    deps.append(type_hint)
+        
+        def process_class(type_cls):
+            if type_cls.__name__ in seen:
+                return
+            seen.add(type_cls.__name__)
+            
+            if issubclass(type_cls, Enum):
+                lines.append(f"{type_cls.__name__} (ENUM):")
+                for value in type_cls._value2member_map_.keys():
+                    lines.append(f"    {value}")
+            elif issubclass(type_cls, Thing):
+                lines.append(f"{type_cls.__name__}:")
+                deps = []
+                for name, info in type_cls.model_fields.items():
+                    type_str = format_type(info.annotation)
+                    desc = f" ({info.description})" if info.description else ""
+                    lines.append(f"    {name}: {type_str}{desc}")
+                    collect_dependencies(info.annotation, deps)
+                
+                for dep in deps:
+                    if dep not in to_process and dep.__name__ not in seen:
+                        to_process.append(dep)
+        
+        process_class(cls)
+        
+        while to_process:
+            next_type = to_process.pop(0)
+            process_class(next_type)
+        
+        return '\n'.join(lines)
